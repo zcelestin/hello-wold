@@ -5,7 +5,7 @@
 //| Impulse -> 50% retracement -> FVG -> 3-candle reaction -> market  |
 //+------------------------------------------------------------------+
 #property copyright "Celestin Zongo"
-#property version   "2.00"
+#property version   "2.01"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -110,6 +110,12 @@ void Debug(string msg) {
     if (ShowDebugInfo) Print("[FVG] ", msg);
 }
 
+string BiasName(BiasDirection b) {
+    if (b == BIAS_BULLISH) return "BULL";
+    if (b == BIAS_BEARISH) return "BEAR";
+    return "FLAT";
+}
+
 bool IsNewBar() {
     datetime t = iTime(_Symbol, PERIOD_M30, 0);
     if (t == 0 || t == g_lastBarTime) return false;
@@ -197,29 +203,51 @@ bool IsAlignmentValid(BiasDirection d1, BiasDirection h4, BiasDirection m30) {
 // IMPULSE DETECTION
 //+------------------------------------------------------------------+
 
-// A bullish impulse requires the swing high to come AFTER the swing low
-// (smaller shift = more recent); otherwise the leg is a down move.
+// The bullish impulse tops at the most recent swing high; its origin is the
+// nearest swing low BEFORE it. The retracement we are waiting for creates a
+// newer swing low after the high, which must not be mistaken for the origin.
 bool DetectImpulse(BiasDirection direction, const MqlRates &rates[], int total, FVGSetup &setup) {
     SwingPoint highs[], lows[];
     int nh = FindSwings(rates, total, true,  highs);
     int nl = FindSwings(rates, total, false, lows);
-    if (nh < 1 || nl < 1) return false;
+    if (nh < 1 || nl < 1) { Debug("not enough M30 swings"); return false; }
 
     if (direction == BIAS_BULLISH) {
-        if (highs[0].shift >= lows[0].shift) return false;
+        setup.impulseHigh      = highs[0].price;
+        setup.impulseHighShift = highs[0].shift;
+
+        int idx = -1;
+        for (int i = 0; i < nl; i++)
+            if (lows[i].shift > setup.impulseHighShift) { idx = i; break; }
+        if (idx < 0) { Debug("no swing low precedes the impulse high"); return false; }
+
+        setup.impulseLow      = lows[idx].price;
+        setup.impulseLowShift = lows[idx].shift;
     } else {
-        if (lows[0].shift >= highs[0].shift) return false;
+        setup.impulseLow      = lows[0].price;
+        setup.impulseLowShift = lows[0].shift;
+
+        int idx = -1;
+        for (int i = 0; i < nh; i++)
+            if (highs[i].shift > setup.impulseLowShift) { idx = i; break; }
+        if (idx < 0) { Debug("no swing high precedes the impulse low"); return false; }
+
+        setup.impulseHigh      = highs[idx].price;
+        setup.impulseHighShift = highs[idx].shift;
     }
 
-    setup.impulseHigh      = highs[0].price;
-    setup.impulseLow       = lows[0].price;
-    setup.impulseHighShift = highs[0].shift;
-    setup.impulseLowShift  = lows[0].shift;
-
-    if (setup.impulseHigh - setup.impulseLow < MinImpulsePips * PipSize()) return false;
+    double sizePips = (setup.impulseHigh - setup.impulseLow) / PipSize();
+    if (sizePips < MinImpulsePips) {
+        Debug(StringFormat("impulse %.1f pips < %.1f required", sizePips, MinImpulsePips));
+        return false;
+    }
 
     int legBars = MathAbs(setup.impulseHighShift - setup.impulseLowShift);
-    return (legBars >= ImpulseMinBars);
+    if (legBars < ImpulseMinBars) {
+        Debug(StringFormat("impulse leg %d bars < %d required", legBars, ImpulseMinBars));
+        return false;
+    }
+    return true;
 }
 
 double CalculateFibonacciLevel(const FVGSetup &setup, BiasDirection direction) {
@@ -277,11 +305,23 @@ FVGSetup DetectFVGSetup(BiasDirection direction, const MqlRates &rates[], int to
 
     setup.fibLevel = CalculateFibonacciLevel(setup, direction);
 
+    // Measured at the deepest point reached since the impulse ended, not at the
+    // latest close: by the time the reaction confirms, price has already left
+    // the zone and the current close would understate the retracement.
     double range = setup.impulseHigh - setup.impulseLow;
-    double price = rates[1].close;
-    double retracement = (direction == BIAS_BULLISH)
-                       ? (setup.impulseHigh - price) / range
-                       : (price - setup.impulseLow)  / range;
+    double retracement;
+
+    if (direction == BIAS_BULLISH) {
+        double deepest = rates[1].low;
+        for (int i = 1; i <= setup.impulseHighShift && i < total; i++)
+            deepest = MathMin(deepest, rates[i].low);
+        retracement = (setup.impulseHigh - deepest) / range;
+    } else {
+        double highest = rates[1].high;
+        for (int i = 1; i <= setup.impulseLowShift && i < total; i++)
+            highest = MathMax(highest, rates[i].high);
+        retracement = (highest - setup.impulseLow) / range;
+    }
 
     if (retracement < FibonacciRetracementLevel) {
         Debug(StringFormat("retracement %.1f%% < %.0f%%", retracement * 100.0,
@@ -577,8 +617,20 @@ int OnInit() {
         return INIT_PARAMETERS_INCORRECT;
     }
 
-    Print("=== FVG Strategy EA v2.00 ===");
+    Print("=== FVG Strategy EA v2.01 ===");
     Print("Symbol: ", _Symbol, " | Risk: ", RiskPercentage, "% | Min R:R: ", MinRiskRewardRatio);
+
+    // Swing structure needs deep history on every timeframe; a short chart
+    // silently reports a flat bias and the EA would never find an alignment.
+    ENUM_TIMEFRAMES frames[] = {PERIOD_D1, PERIOD_H4, PERIOD_M30};
+    string names[] = {"D1", "H4", "M30"};
+    for (int i = 0; i < 3; i++) {
+        int available = Bars(_Symbol, frames[i]);
+        if (available < BiasLookbackBars)
+            Print("[FVG] Warning: ", names[i], " has ", available, " bars, ",
+                  BiasLookbackBars, " expected. Load more history.");
+    }
+
     return INIT_SUCCEEDED;
 }
 
@@ -599,12 +651,22 @@ void OnTick() {
     BiasDirection h4  = AnalyzeBias(PERIOD_H4);
     BiasDirection m30 = AnalyzeBias(PERIOD_M30);
 
+    // Logged on change only, so the journal shows the structure trail without
+    // one line per bar.
+    static string lastState = "";
+    string state = BiasName(d1) + " / " + BiasName(h4) + " / " + BiasName(m30);
+    if (state != lastState) {
+        lastState = state;
+        Debug("bias D1/H4/M30 = " + state +
+              (IsAlignmentValid(d1, h4, m30) ? "   << ALIGNED" : ""));
+    }
+
     if (!IsAlignmentValid(d1, h4, m30)) return;
 
     MqlRates rates[];
     ArraySetAsSeries(rates, true);
     int copied = CopyRates(_Symbol, PERIOD_M30, 0, EntryLookbackBars, rates);
-    if (copied < 50) return;
+    if (copied < 50) { Debug(StringFormat("only %d M30 bars available", copied)); return; }
 
     FVGSetup setup = DetectFVGSetup(d1, rates, copied);
     if (!setup.isValid) return;
