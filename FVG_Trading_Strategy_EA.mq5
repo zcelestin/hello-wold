@@ -1,259 +1,300 @@
 //+------------------------------------------------------------------+
-//|                    FVG Trading Strategy EA                        |
+//|                                       FVG_Trading_Strategy_EA.mq5 |
 //|                                                                   |
-//| Strategy: Fair Value Gap (FVG) with Multi-Timeframe Analysis     |
-//| Timeframes: D1 (Bias) → H4 (Confirmation) → M30 (Entry)         |
-//| Created: 2026                                                    |
+//| D1 bias -> H4 confirm -> M30 entry                                |
+//| Impulse -> 50% retracement -> FVG -> 3-candle reaction -> market  |
 //+------------------------------------------------------------------+
-
-#property copyright "FVG Trading System"
-#property link "https://github.com/zcelestin/hello-wold"
-#property version "1.0"
-#property description "FVG Trading Strategy EA based on Multi-Timeframe Analysis"
+#property copyright "Celestin Zongo"
+#property version   "2.00"
+#property strict
 
 #include <Trade\Trade.mqh>
-#include <Trade\SymbolInfo.mqh>
+#include <Trade\PositionInfo.mqh>
 
 //+------------------------------------------------------------------+
 // INPUT PARAMETERS
 //+------------------------------------------------------------------+
 
-input group "=== Risk Management ==="
-input double RiskPercentage = 1.0;              // Risk per trade (0.5 - 1%)
-input double MinRiskRewardRatio = 2.0;          // Minimum Risk/Reward ratio
-input int MaxOpenTrades = 1;                    // Maximum simultaneous trades
+input group "=== Risk Management ===";
+input double RiskPercentage            = 1.0;    // Risk per trade (% of balance)
+input double MinRiskRewardRatio        = 2.0;    // Minimum Risk/Reward ratio
+input int    MaxOpenTrades             = 1;      // Max simultaneous trades + orders
+input int    MagicNumber               = 123456; // Magic number
 
-input group "=== Strategy Parameters ==="
-input double FibonacciRetracementLevel = 0.5;  // Fibonacci retracement level (50%)
-input int ImpulseMinBars = 5;                   // Minimum bars for impulse
-input double FVGMinPips = 5.0;                  // Minimum FVG size in pips
-input bool RequireVolumeConfirmation = true;   // Require volume confirmation
+input group "=== Structure / Impulse ===";
+input int    BiasLookbackBars          = 120;    // Bars scanned for swing structure
+input int    EntryLookbackBars         = 200;    // M30 bars scanned for impulse/FVG
+input int    ImpulseMinBars            = 5;      // Minimum bars in the impulse leg
+input double MinImpulsePips            = 20.0;   // Minimum impulse size (pips)
 
-input group "=== Candle Confirmation ==="
-input bool RequireRejectionCandle = true;      // Candle 1: Rejection
-input bool RequireIndecisionCandle = true;     // Candle 2: Indecision
-input bool RequireConfirmationCandle = true;   // Candle 3: Strong confirmation
-input double MinConfirmationBodyPercent = 60.0; // Min body size for confirmation (%)
+input group "=== Retracement / FVG ===";
+input double FibonacciRetracementLevel = 0.5;    // Minimum retracement (0.5 = 50%)
+input double MaxRetracement            = 1.0;    // Above this the setup is invalid
+input double FVGMinPips                = 3.0;    // Minimum FVG size (pips)
 
-input group "=== Trading Hours ==="
-input int StartHour = 0;                       // Start trading at (0-23)
-input int EndHour = 23;                        // Stop trading at (0-23)
+input group "=== Candle Confirmation ===";
+input bool   RequireRejectionCandle     = true;  // Candle 1: rejection inside FVG
+input bool   RequireIndecisionCandle    = true;  // Candle 2: indecision
+input bool   RequireConfirmationCandle  = true;  // Candle 3: strong close
+input bool   RequireVolumeConfirmation  = true;  // Candle 3 volume > candles 1 & 2
+input double MaxIndecisionBodyPercent   = 40.0;  // Max body size for indecision (%)
+input double MinConfirmationBodyPercent = 60.0;  // Min body size for confirmation (%)
 
-input group "=== EA Settings ==="
-input bool ShowDebugInfo = true;               // Show debug information
-input bool UseTrailingStop = false;             // Use trailing stop
-input int TrailingStopDistance = 50;            // Trailing stop distance (pips)
+input group "=== Execution ===";
+input int    MaxSpreadPoints    = 30;   // Max spread allowed (points, 0 = off)
+input int    SlippagePoints     = 20;   // Max deviation (points)
+input int    SLBufferPoints     = 20;   // Extra distance below/above invalidation
+
+input group "=== Trading Hours (server time) ===";
+input int    StartHour = 0;             // Start trading at (0-23)
+input int    EndHour   = 23;            // Stop trading at (0-23)
+
+input group "=== EA Settings ===";
+input bool   ShowDebugInfo        = true;   // Log why a setup was rejected
+input bool   UseTrailingStop      = false;  // Use trailing stop
+input int    TrailingStopPoints   = 500;    // Trailing distance (points)
 
 //+------------------------------------------------------------------+
-// GLOBAL VARIABLES
+// TYPES & GLOBALS
 //+------------------------------------------------------------------+
 
-CTrade trade;
-CSymbolInfo symInfo;
+CTrade        trade;
+CPositionInfo posInfo;
 
 enum BiasDirection {
-    BIAS_NEUTRAL = 0,
-    BIAS_BULLISH = 1,
+    BIAS_NEUTRAL =  0,
+    BIAS_BULLISH =  1,
     BIAS_BEARISH = -1
 };
 
+struct SwingPoint {
+    double price;
+    int    shift;
+};
+
 struct FVGSetup {
-    bool isValid;
+    bool          isValid;
     BiasDirection direction;
-    double fvgHigh;
-    double fvgLow;
-    double fibLevel;
-    int detectionBar;
-    double impulseHigh;
-    double impulseLow;
+    double        impulseHigh;
+    double        impulseLow;
+    int           impulseHighShift;
+    int           impulseLowShift;
+    double        fibLevel;
+    double        fvgHigh;
+    double        fvgLow;
 };
 
-struct ConfirmationPattern {
-    bool hasRejectionCandle;
-    bool hasIndecisionCandle;
-    bool hasConfirmationCandle;
-    bool isComplete;
-};
+datetime g_lastBarTime = 0;
 
 //+------------------------------------------------------------------+
-// INITIALIZATION & DEINITIALIZATION
+// HELPERS
 //+------------------------------------------------------------------+
 
-int OnInit() {
-    trade.SetExpertMagicNumber(123456);
-
-    if (!symInfo.Name(_Symbol)) {
-        Print("Error: Failed to initialize symbol info");
-        return INIT_FAILED;
-    }
-
-    if (ShowDebugInfo) {
-        Print("=== FVG Trading Strategy EA Initialized ===");
-        Print("Symbol: ", _Symbol);
-        Print("Risk per trade: ", RiskPercentage, "%");
-        Print("Min R:R Ratio: ", MinRiskRewardRatio, ":1");
-    }
-
-    return INIT_SUCCEEDED;
+double PipSize() {
+    return (_Digits == 3 || _Digits == 5) ? _Point * 10.0 : _Point;
 }
 
-void OnDeinit(const int reason) {
-    if (ShowDebugInfo) {
-        Print("EA Deinitialized");
-    }
+int VolumeDigits(double step) {
+    int d = 0;
+    while (step < 1.0 && d < 8) { step *= 10.0; d++; }
+    return d;
+}
+
+double MinStopDistance() {
+    long level = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    if (level <= 0) level = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * 2;
+    return level * _Point;
+}
+
+void Debug(string msg) {
+    if (ShowDebugInfo) Print("[FVG] ", msg);
+}
+
+bool IsNewBar() {
+    datetime t = iTime(_Symbol, PERIOD_M30, 0);
+    if (t == 0 || t == g_lastBarTime) return false;
+    g_lastBarTime = t;
+    return true;
+}
+
+bool IsTradingTime() {
+    MqlDateTime dt;
+    TimeToStruct(TimeCurrent(), dt);
+    if (StartHour == EndHour) return true;
+    if (StartHour < EndHour)  return (dt.hour >= StartHour && dt.hour < EndHour);
+    return (dt.hour >= StartHour || dt.hour < EndHour);
+}
+
+bool SpreadOK() {
+    if (MaxSpreadPoints <= 0) return true;
+    return SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) <= MaxSpreadPoints;
 }
 
 //+------------------------------------------------------------------+
-// MAIN LOOP
+// SWING DETECTION
 //+------------------------------------------------------------------+
 
-void OnTick() {
-    // Check if it's trading time
-    if (!IsTradingTime()) {
-        return;
-    }
+// Fractal swing: extreme against the two bars either side. Scanning starts at
+// shift 3 so bar 0 (still forming) never takes part in confirming a swing.
+int FindSwings(const MqlRates &rates[], int total, bool findHighs, SwingPoint &out[]) {
+    ArrayResize(out, 0);
+    int found = 0;
 
-    // Check existing positions
-    if (CountOpenTrades() >= MaxOpenTrades) {
-        ManageExistingTrades();
-        return;
-    }
-
-    // Analyze market setup
-    BiasDirection d1Bias = AnalyzeBias(PERIOD_D1);
-    BiasDirection h4Bias = AnalyzeBias(PERIOD_H4);
-    BiasDirection m30Bias = AnalyzeBias(PERIOD_M30);
-
-    // Validate alignment
-    if (!IsAlignmentValid(d1Bias, h4Bias, m30Bias)) {
-        return;
-    }
-
-    // Identify impulse and FVG
-    FVGSetup fvgSetup = DetectFVGSetup(m30Bias);
-    if (!fvgSetup.isValid) {
-        return;
-    }
-
-    // Check confirmation pattern
-    ConfirmationPattern pattern = ValidateConfirmationPattern(fvgSetup);
-    if (!pattern.isComplete) {
-        return;
-    }
-
-    // Calculate entry, SL, TP
-    double entryPrice, stopLoss, takeProfit;
-    if (!CalculatePriceTargets(fvgSetup, entryPrice, stopLoss, takeProfit)) {
-        return;
-    }
-
-    // Validate R:R ratio
-    double riskRewardRatio = CalculateRiskReward(entryPrice, stopLoss, takeProfit, fvgSetup.direction);
-    if (riskRewardRatio < MinRiskRewardRatio) {
-        if (ShowDebugInfo) {
-            Print("R:R ratio too low: ", riskRewardRatio, " vs required: ", MinRiskRewardRatio);
+    for (int i = 3; i <= total - 3; i++) {
+        bool isSwing;
+        if (findHighs) {
+            double v = rates[i].high;
+            isSwing = (v > rates[i-1].high && v > rates[i-2].high &&
+                       v > rates[i+1].high && v > rates[i+2].high);
+        } else {
+            double v = rates[i].low;
+            isSwing = (v < rates[i-1].low && v < rates[i-2].low &&
+                       v < rates[i+1].low && v < rates[i+2].low);
         }
-        return;
-    }
 
-    // Calculate lot size
-    double lotSize = CalculateLotSize(stopLoss, fvgSetup.direction);
-    if (lotSize <= 0) {
-        return;
+        if (isSwing) {
+            ArrayResize(out, found + 1);
+            out[found].price = findHighs ? rates[i].high : rates[i].low;
+            out[found].shift = i;
+            found++;
+        }
     }
-
-    // Execute trade
-    ExecuteTrade(fvgSetup.direction, entryPrice, stopLoss, takeProfit, lotSize);
+    return found;   // out[0] is the most recent swing
 }
 
 //+------------------------------------------------------------------+
-// TIMEFRAME BIAS ANALYSIS
+// BIAS ANALYSIS (HH/HL vs LH/LL)
 //+------------------------------------------------------------------+
 
 BiasDirection AnalyzeBias(ENUM_TIMEFRAMES timeframe) {
-    int bars = 20; // Analyze last 20 bars
-    double highestHigh = High[iHighest(_Symbol, timeframe, MODE_HIGH, bars, 1)];
-    double lowestLow = Low[iLowest(_Symbol, timeframe, MODE_LOW, bars, 1)];
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
 
-    // Count Higher Highs, Higher Lows (bullish) vs Lower Highs, Lower Lows (bearish)
-    int hhCount = 0, llCount = 0;
+    int copied = CopyRates(_Symbol, timeframe, 0, BiasLookbackBars, rates);
+    if (copied < 30) return BIAS_NEUTRAL;
 
-    for (int i = 2; i < bars - 1; i++) {
-        double high_i = iHigh(_Symbol, timeframe, i);
-        double high_i1 = iHigh(_Symbol, timeframe, i + 1);
-        double low_i = iLow(_Symbol, timeframe, i);
-        double low_i1 = iLow(_Symbol, timeframe, i + 1);
+    SwingPoint highs[], lows[];
+    int nh = FindSwings(rates, copied, true,  highs);
+    int nl = FindSwings(rates, copied, false, lows);
+    if (nh < 2 || nl < 2) return BIAS_NEUTRAL;
 
-        if (high_i > high_i1) hhCount++;
-        if (low_i < low_i1) llCount++;
-    }
+    bool higherHigh = highs[0].price > highs[1].price;
+    bool higherLow  = lows[0].price  > lows[1].price;
+    bool lowerHigh  = highs[0].price < highs[1].price;
+    bool lowerLow   = lows[0].price  < lows[1].price;
 
-    // Determine bias
-    if (hhCount > llCount) {
-        return BIAS_BULLISH;
-    } else if (llCount > hhCount) {
-        return BIAS_BEARISH;
-    }
-
+    if (higherHigh && higherLow) return BIAS_BULLISH;
+    if (lowerHigh  && lowerLow)  return BIAS_BEARISH;
     return BIAS_NEUTRAL;
 }
 
-//+------------------------------------------------------------------+
-// ALIGNMENT VALIDATION
-//+------------------------------------------------------------------+
-
 bool IsAlignmentValid(BiasDirection d1, BiasDirection h4, BiasDirection m30) {
-    // All three timeframes must align
-    if (d1 == BIAS_NEUTRAL || h4 == BIAS_NEUTRAL || m30 == BIAS_NEUTRAL) {
-        return false;
+    if (d1 == BIAS_NEUTRAL) return false;
+    return (d1 == h4 && h4 == m30);
+}
+
+//+------------------------------------------------------------------+
+// IMPULSE DETECTION
+//+------------------------------------------------------------------+
+
+// A bullish impulse requires the swing high to come AFTER the swing low
+// (smaller shift = more recent); otherwise the leg is a down move.
+bool DetectImpulse(BiasDirection direction, const MqlRates &rates[], int total, FVGSetup &setup) {
+    SwingPoint highs[], lows[];
+    int nh = FindSwings(rates, total, true,  highs);
+    int nl = FindSwings(rates, total, false, lows);
+    if (nh < 1 || nl < 1) return false;
+
+    if (direction == BIAS_BULLISH) {
+        if (highs[0].shift >= lows[0].shift) return false;
+    } else {
+        if (lows[0].shift >= highs[0].shift) return false;
     }
 
-    if (d1 != h4 || h4 != m30) {
-        return false;
-    }
+    setup.impulseHigh      = highs[0].price;
+    setup.impulseLow       = lows[0].price;
+    setup.impulseHighShift = highs[0].shift;
+    setup.impulseLowShift  = lows[0].shift;
 
-    return true;
+    if (setup.impulseHigh - setup.impulseLow < MinImpulsePips * PipSize()) return false;
+
+    int legBars = MathAbs(setup.impulseHighShift - setup.impulseLowShift);
+    return (legBars >= ImpulseMinBars);
+}
+
+double CalculateFibonacciLevel(const FVGSetup &setup, BiasDirection direction) {
+    double range = setup.impulseHigh - setup.impulseLow;
+    if (direction == BIAS_BULLISH) return setup.impulseHigh - range * FibonacciRetracementLevel;
+    return setup.impulseLow + range * FibonacciRetracementLevel;
 }
 
 //+------------------------------------------------------------------+
 // FVG DETECTION
 //+------------------------------------------------------------------+
 
-FVGSetup DetectFVGSetup(BiasDirection direction) {
+// Bullish FVG: the low of the third candle sits ABOVE the high of the first,
+// leaving an untraded gap. Bearish is the mirror. Only gaps inside the impulse
+// leg and at/beyond the 50% level qualify.
+bool DetectFVG(BiasDirection direction, const MqlRates &rates[], int total, FVGSetup &setup) {
+    int newest = (direction == BIAS_BULLISH) ? setup.impulseHighShift : setup.impulseLowShift;
+    int oldest = (direction == BIAS_BULLISH) ? setup.impulseLowShift  : setup.impulseHighShift;
+
+    double minGap = FVGMinPips * PipSize();
+
+    for (int i = newest; i + 2 <= oldest && i + 2 < total; i++) {
+        double gapLow, gapHigh;
+
+        if (direction == BIAS_BULLISH) {
+            gapLow  = rates[i+2].high;
+            gapHigh = rates[i].low;
+            if (gapHigh - gapLow < minGap)      continue;
+            if (gapLow < setup.impulseLow)      continue;
+            if ((gapHigh + gapLow) * 0.5 > setup.fibLevel) continue;
+        } else {
+            gapLow  = rates[i].high;
+            gapHigh = rates[i+2].low;
+            if (gapHigh - gapLow < minGap)      continue;
+            if (gapHigh > setup.impulseHigh)    continue;
+            if ((gapHigh + gapLow) * 0.5 < setup.fibLevel) continue;
+        }
+
+        setup.fvgHigh = gapHigh;
+        setup.fvgLow  = gapLow;
+        return true;   // most recent qualifying gap
+    }
+    return false;
+}
+
+FVGSetup DetectFVGSetup(BiasDirection direction, const MqlRates &rates[], int total) {
     FVGSetup setup;
-    setup.isValid = false;
+    ZeroMemory(setup);
     setup.direction = direction;
 
-    // Detect impulse first
-    if (!DetectImpulse(direction, setup.impulseHigh, setup.impulseLow, setup.detectionBar)) {
+    if (!DetectImpulse(direction, rates, total, setup)) {
+        Debug("no valid impulse");
         return setup;
     }
 
-    // Calculate Fibonacci retracement
-    double fibLevel = CalculateFibonacciLevel(setup.impulseHigh, setup.impulseLow, direction);
-    setup.fibLevel = fibLevel;
+    setup.fibLevel = CalculateFibonacciLevel(setup, direction);
 
-    // Check if retracement reaches 50%
-    double currentPrice = Close[0];
-    if (direction == BIAS_BULLISH) {
-        double retracementPercent = (setup.impulseHigh - currentPrice) / (setup.impulseHigh - setup.impulseLow);
-        if (retracementPercent < 0.5) {
-            return setup; // Retracement less than 50%
-        }
-    } else {
-        double retracementPercent = (currentPrice - setup.impulseLow) / (setup.impulseHigh - setup.impulseLow);
-        if (retracementPercent < 0.5) {
-            return setup; // Retracement less than 50%
-        }
+    double range = setup.impulseHigh - setup.impulseLow;
+    double price = rates[1].close;
+    double retracement = (direction == BIAS_BULLISH)
+                       ? (setup.impulseHigh - price) / range
+                       : (price - setup.impulseLow)  / range;
+
+    if (retracement < FibonacciRetracementLevel) {
+        Debug(StringFormat("retracement %.1f%% < %.0f%%", retracement * 100.0,
+                           FibonacciRetracementLevel * 100.0));
+        return setup;
     }
-
-    // Detect FVG
-    if (!DetectFVG(direction, setup.fvgHigh, setup.fvgLow)) {
+    if (retracement > MaxRetracement) {
+        Debug(StringFormat("retracement %.1f%% invalidates the leg", retracement * 100.0));
         return setup;
     }
 
-    // Validate FVG is within Fibonacci zone
-    if (!IsValidFVGPosition(setup, direction)) {
+    if (!DetectFVG(direction, rates, total, setup)) {
+        Debug("no FVG in the retracement zone");
         return setup;
     }
 
@@ -261,356 +302,321 @@ FVGSetup DetectFVGSetup(BiasDirection direction) {
     return setup;
 }
 
-bool DetectImpulse(BiasDirection direction, double &impulseHigh, double &impulseLow, int &detectionBar) {
-    if (direction == BIAS_BULLISH) {
-        impulseHigh = iHigh(_Symbol, PERIOD_M30, iHighest(_Symbol, PERIOD_M30, MODE_HIGH, ImpulseMinBars, 1));
-        impulseHigh = MathMax(impulseHigh, iHigh(_Symbol, PERIOD_M30, 1));
-
-        // Find the low point before the impulse
-        int lowestBar = iLowest(_Symbol, PERIOD_M30, MODE_LOW, ImpulseMinBars, 1);
-        impulseLow = iLow(_Symbol, PERIOD_M30, lowestBar);
-
-        detectionBar = 1;
-        return impulseHigh > impulseLow + FVGMinPips * _Point;
-    } else {
-        impulseLow = iLow(_Symbol, PERIOD_M30, iLowest(_Symbol, PERIOD_M30, MODE_LOW, ImpulseMinBars, 1));
-        impulseLow = MathMin(impulseLow, iLow(_Symbol, PERIOD_M30, 1));
-
-        // Find the high point before the impulse
-        int highestBar = iHighest(_Symbol, PERIOD_M30, MODE_HIGH, ImpulseMinBars, 1);
-        impulseHigh = iHigh(_Symbol, PERIOD_M30, highestBar);
-
-        detectionBar = 1;
-        return impulseHigh > impulseLow + FVGMinPips * _Point;
-    }
-}
-
-double CalculateFibonacciLevel(double high, double low, BiasDirection direction) {
-    if (direction == BIAS_BULLISH) {
-        return high - ((high - low) * FibonacciRetracementLevel);
-    } else {
-        return low + ((high - low) * FibonacciRetracementLevel);
-    }
-}
-
-bool DetectFVG(BiasDirection direction, double &fvgHigh, double &fvgLow) {
-    // FVG is created by 3 candles: gap between candle 1 high and candle 3 low (bullish)
-    // or gap between candle 1 low and candle 3 high (bearish)
-
-    if (direction == BIAS_BULLISH) {
-        // Check for bullish FVG: High(1) > Low(3)
-        double candle1High = iHigh(_Symbol, PERIOD_M30, 3);
-        double candle3Low = iLow(_Symbol, PERIOD_M30, 1);
-
-        if (candle1High > candle3Low) {
-            fvgLow = candle3Low;
-            fvgHigh = candle1High;
-            return true;
-        }
-    } else {
-        // Check for bearish FVG: Low(1) < High(3)
-        double candle1Low = iLow(_Symbol, PERIOD_M30, 3);
-        double candle3High = iHigh(_Symbol, PERIOD_M30, 1);
-
-        if (candle1Low < candle3High) {
-            fvgLow = candle1Low;
-            fvgHigh = candle3High;
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool IsValidFVGPosition(FVGSetup &setup, BiasDirection direction) {
-    // FVG should be within 50% - 100% of retracement zone
-    if (direction == BIAS_BULLISH) {
-        double fvgMid = (setup.fvgHigh + setup.fvgLow) / 2;
-        return fvgMid >= setup.fibLevel && fvgMid <= setup.impulseHigh;
-    } else {
-        double fvgMid = (setup.fvgHigh + setup.fvgLow) / 2;
-        return fvgMid <= setup.fibLevel && fvgMid >= setup.impulseLow;
-    }
-}
-
 //+------------------------------------------------------------------+
-// CONFIRMATION PATTERN (3 CANDLES)
+// 3-CANDLE CONFIRMATION (bars 3 -> 2 -> 1, all closed)
 //+------------------------------------------------------------------+
 
-ConfirmationPattern ValidateConfirmationPattern(FVGSetup &setup) {
-    ConfirmationPattern pattern;
-    pattern.hasRejectionCandle = false;
-    pattern.hasIndecisionCandle = false;
-    pattern.hasConfirmationCandle = false;
-    pattern.isComplete = false;
+bool ValidateConfirmation(BiasDirection direction, const MqlRates &rates[], const FVGSetup &setup) {
+    double range3 = rates[3].high - rates[3].low;
+    double range2 = rates[2].high - rates[2].low;
+    double range1 = rates[1].high - rates[1].low;
+    if (range3 <= 0.0 || range2 <= 0.0 || range1 <= 0.0) return false;
 
-    if (!RequireRejectionCandle && !RequireIndecisionCandle && !RequireConfirmationCandle) {
-        pattern.isComplete = true;
-        return pattern;
+    bool rejection    = true;
+    bool indecision   = true;
+    bool confirmation = true;
+
+    if (RequireRejectionCandle) {
+        if (direction == BIAS_BULLISH) {
+            rejection = (rates[3].low <= setup.fvgHigh) &&
+                        (rates[3].close >= rates[3].low + range3 * 0.5);
+        } else {
+            rejection = (rates[3].high >= setup.fvgLow) &&
+                        (rates[3].close <= rates[3].high - range3 * 0.5);
+        }
+        if (!rejection) { Debug("candle 3: no rejection in FVG"); return false; }
     }
 
-    // Analyze last 3 candles for pattern
-    double close0 = iClose(_Symbol, PERIOD_M30, 0);
-    double close1 = iClose(_Symbol, PERIOD_M30, 1);
-    double close2 = iClose(_Symbol, PERIOD_M30, 2);
-    double close3 = iClose(_Symbol, PERIOD_M30, 3);
-
-    double open0 = iOpen(_Symbol, PERIOD_M30, 0);
-    double open1 = iOpen(_Symbol, PERIOD_M30, 1);
-    double open2 = iOpen(_Symbol, PERIOD_M30, 2);
-
-    double high0 = iHigh(_Symbol, PERIOD_M30, 0);
-    double high1 = iHigh(_Symbol, PERIOD_M30, 1);
-    double high2 = iHigh(_Symbol, PERIOD_M30, 2);
-
-    double low0 = iLow(_Symbol, PERIOD_M30, 0);
-    double low1 = iLow(_Symbol, PERIOD_M30, 1);
-    double low2 = iLow(_Symbol, PERIOD_M30, 2);
-
-    if (setup.direction == BIAS_BULLISH) {
-        // Candle 1: Rejection - dips into FVG but closes higher
-        if (RequireRejectionCandle) {
-            pattern.hasRejectionCandle = (low1 < setup.fvgHigh) && (close1 > open1);
-        }
-
-        // Candle 2: Indecision - small body, low volume mentally
-        if (RequireIndecisionCandle) {
-            double bodySize = MathAbs(close0 - open0);
-            double range = high0 - low0;
-            pattern.hasIndecisionCandle = (bodySize < range * 0.4); // Body < 40% of range
-        }
-
-        // Candle 3: Strong confirmation - large bullish body
-        if (RequireConfirmationCandle) {
-            double bodySize = close0 - open0;
-            double range = high0 - low0;
-            double bodyPercent = (bodySize / range) * 100.0;
-            pattern.hasConfirmationCandle = (bodyPercent >= MinConfirmationBodyPercent) && (close0 > open0);
-        }
-    } else {
-        // Candle 1: Rejection - rallies into FVG but closes lower
-        if (RequireRejectionCandle) {
-            pattern.hasRejectionCandle = (high1 > setup.fvgLow) && (close1 < open1);
-        }
-
-        // Candle 2: Indecision - small body
-        if (RequireIndecisionCandle) {
-            double bodySize = MathAbs(close0 - open0);
-            double range = high0 - low0;
-            pattern.hasIndecisionCandle = (bodySize < range * 0.4);
-        }
-
-        // Candle 3: Strong confirmation - large bearish body
-        if (RequireConfirmationCandle) {
-            double bodySize = open0 - close0;
-            double range = high0 - low0;
-            double bodyPercent = (bodySize / range) * 100.0;
-            pattern.hasConfirmationCandle = (bodyPercent >= MinConfirmationBodyPercent) && (close0 < open0);
-        }
+    if (RequireIndecisionCandle) {
+        double body2 = MathAbs(rates[2].close - rates[2].open);
+        indecision = (body2 / range2 * 100.0 <= MaxIndecisionBodyPercent);
+        if (!indecision) { Debug("candle 2: not an indecision candle"); return false; }
     }
 
-    // Check if pattern is complete
-    pattern.isComplete = pattern.hasRejectionCandle || pattern.hasIndecisionCandle || pattern.hasConfirmationCandle;
+    if (RequireConfirmationCandle) {
+        double body1 = (direction == BIAS_BULLISH)
+                     ? rates[1].close - rates[1].open
+                     : rates[1].open  - rates[1].close;
 
-    return pattern;
-}
+        confirmation = (body1 > 0.0) && (body1 / range1 * 100.0 >= MinConfirmationBodyPercent);
+        if (!confirmation) { Debug("candle 1: confirmation body too weak"); return false; }
 
-//+------------------------------------------------------------------+
-// PRICE TARGETS CALCULATION
-//+------------------------------------------------------------------+
-
-bool CalculatePriceTargets(FVGSetup &setup, double &entryPrice, double &stopLoss, double &takeProfit) {
-    double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-    if (setup.direction == BIAS_BULLISH) {
-        entryPrice = setup.fvgHigh; // Enter on FVG top
-        stopLoss = setup.impulseLow - (FVGMinPips * _Point); // SL below impulse low
-
-        // TP: Look for previous H4 high or structure
-        takeProfit = GetPreviousResistance(setup.impulseHigh);
-
-        if (takeProfit <= entryPrice) {
-            takeProfit = entryPrice + (MathAbs(entryPrice - stopLoss) * 2.5);
-        }
-    } else {
-        entryPrice = setup.fvgLow; // Enter on FVG bottom
-        stopLoss = setup.impulseHigh + (FVGMinPips * _Point); // SL above impulse high
-
-        // TP: Look for previous H4 low or structure
-        takeProfit = GetPreviousSupport(setup.impulseLow);
-
-        if (takeProfit >= entryPrice) {
-            takeProfit = entryPrice - (MathAbs(stopLoss - entryPrice) * 2.5);
+        if (RequireVolumeConfirmation) {
+            long v1 = (long)rates[1].tick_volume;
+            if (v1 <= (long)rates[2].tick_volume || v1 <= (long)rates[3].tick_volume) {
+                Debug("candle 1: volume does not confirm");
+                return false;
+            }
         }
     }
 
     return true;
 }
 
-double GetPreviousResistance(double baseLevel) {
-    // Find previous resistance level on H4
-    double highest = baseLevel;
-    int barsToCheck = 50;
+//+------------------------------------------------------------------+
+// PRICE TARGETS
+//+------------------------------------------------------------------+
 
-    for (int i = 2; i < barsToCheck; i++) {
-        double high = iHigh(_Symbol, PERIOD_H4, i);
-        if (high > baseLevel && high > highest) {
-            highest = high;
-        }
+// Collect swing levels beyond refPrice as take-profit candidates.
+void CollectTargets(ENUM_TIMEFRAMES timeframe, bool wantHighs, double refPrice, double &out[]) {
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+
+    int copied = CopyRates(_Symbol, timeframe, 0, BiasLookbackBars, rates);
+    if (copied < 30) return;
+
+    SwingPoint swings[];
+    int n = FindSwings(rates, copied, wantHighs, swings);
+
+    for (int i = 0; i < n; i++) {
+        if (wantHighs && swings[i].price <= refPrice) continue;
+        if (!wantHighs && swings[i].price >= refPrice) continue;
+
+        int size = ArraySize(out);
+        ArrayResize(out, size + 1);
+        out[size] = swings[i].price;
+    }
+}
+
+// Nearest structural level that still satisfies the minimum R:R.
+bool FindTakeProfit(BiasDirection direction, double entry, double risk, double &takeProfit) {
+    double candidates[];
+    ArrayResize(candidates, 0);
+
+    bool wantHighs = (direction == BIAS_BULLISH);
+    CollectTargets(PERIOD_M30, wantHighs, entry, candidates);
+    CollectTargets(PERIOD_H4,  wantHighs, entry, candidates);
+
+    double best = 0.0;
+    for (int i = 0; i < ArraySize(candidates); i++) {
+        double reward = (direction == BIAS_BULLISH) ? candidates[i] - entry
+                                                    : entry - candidates[i];
+        if (reward / risk < MinRiskRewardRatio) continue;
+
+        if (best == 0.0) best = candidates[i];
+        else if (direction == BIAS_BULLISH && candidates[i] < best) best = candidates[i];
+        else if (direction == BIAS_BEARISH && candidates[i] > best) best = candidates[i];
     }
 
-    return highest;
+    if (best == 0.0) return false;
+    takeProfit = best;
+    return true;
 }
 
-double GetPreviousSupport(double baseLevel) {
-    // Find previous support level on H4
-    double lowest = baseLevel;
-    int barsToCheck = 50;
+bool CalculateTargets(BiasDirection direction, const MqlRates &rates[], const FVGSetup &setup,
+                      double &entry, double &stopLoss, double &takeProfit) {
+    double buffer  = SLBufferPoints * _Point;
+    double minDist = MinStopDistance();
 
-    for (int i = 2; i < barsToCheck; i++) {
-        double low = iLow(_Symbol, PERIOD_H4, i);
-        if (low < baseLevel && low < lowest) {
-            lowest = low;
-        }
+    if (direction == BIAS_BULLISH) {
+        entry = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+        double structureLow = MathMin(setup.fvgLow, rates[1].low);
+        structureLow = MathMin(structureLow, MathMin(rates[2].low, rates[3].low));
+        stopLoss = structureLow - buffer;
+
+        if (entry - stopLoss < minDist) { Debug("stop too close to market"); return false; }
+    } else {
+        entry = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+        double structureHigh = MathMax(setup.fvgHigh, rates[1].high);
+        structureHigh = MathMax(structureHigh, MathMax(rates[2].high, rates[3].high));
+        stopLoss = structureHigh + buffer;
+
+        if (stopLoss - entry < minDist) { Debug("stop too close to market"); return false; }
     }
 
-    return lowest;
-}
+    double risk = MathAbs(entry - stopLoss);
+    if (risk <= 0.0) return false;
 
-//+------------------------------------------------------------------+
-// RISK/REWARD CALCULATION
-//+------------------------------------------------------------------+
-
-double CalculateRiskReward(double entry, double sl, double tp, BiasDirection direction) {
-    double risk = MathAbs(entry - sl);
-    double reward = MathAbs(tp - entry);
-
-    if (risk == 0) return 0;
-
-    return reward / risk;
-}
-
-//+------------------------------------------------------------------+
-// LOT SIZE CALCULATION
-//+------------------------------------------------------------------+
-
-double CalculateLotSize(double stopLoss, BiasDirection direction) {
-    double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-    double riskAmount = accountBalance * (RiskPercentage / 100.0);
-
-    double entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    double pipsRisk = MathAbs(entryPrice - stopLoss) / _Point;
-
-    if (pipsRisk <= 0) return 0;
-
-    double pointValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-    double lotSize = riskAmount / (pipsRisk * pointValue);
-
-    // Normalize lot size
-    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-
-    if (lotSize < minLot) return 0; // Risk too small
-    if (lotSize > maxLot) lotSize = maxLot;
-
-    // Round to step
-    lotSize = MathFloor(lotSize / stepLot) * stepLot;
-
-    return lotSize;
-}
-
-//+------------------------------------------------------------------+
-// TRADE EXECUTION
-//+------------------------------------------------------------------+
-
-bool ExecuteTrade(BiasDirection direction, double entry, double sl, double tp, double lots) {
-    if (!trade.SetTypeFillingBySymbol(_Symbol)) {
+    if (!FindTakeProfit(direction, entry, risk, takeProfit)) {
+        Debug(StringFormat("no structural target reaching %.1f:1", MinRiskRewardRatio));
         return false;
     }
 
-    bool result = false;
+    if (MathAbs(takeProfit - entry) < minDist) { Debug("target too close to market"); return false; }
 
-    if (direction == BIAS_BULLISH) {
-        result = trade.BuyLimit(lots, entry, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "FVG Buy Setup");
-    } else {
-        result = trade.SellLimit(lots, entry, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "FVG Sell Setup");
-    }
-
-    if (result) {
-        if (ShowDebugInfo) {
-            Print("Trade executed successfully!");
-            Print("Direction: ", (direction == BIAS_BULLISH ? "BUY" : "SELL"));
-            Print("Entry: ", entry, " | SL: ", sl, " | TP: ", tp);
-            Print("Lots: ", lots);
-        }
-    } else {
-        Print("Trade failed! Error: ", GetLastError());
-    }
-
-    return result;
+    entry      = NormalizeDouble(entry,      _Digits);
+    stopLoss   = NormalizeDouble(stopLoss,   _Digits);
+    takeProfit = NormalizeDouble(takeProfit, _Digits);
+    return true;
 }
 
 //+------------------------------------------------------------------+
-// TRADE MANAGEMENT
+// POSITION SIZING
 //+------------------------------------------------------------------+
 
-void ManageExistingTrades() {
-    // Check for trailing stop
-    if (UseTrailingStop) {
-        UpdateTrailingStops();
+// Risk is converted through tick value / tick size, not raw points: on symbols
+// where tick size differs from point, the two are not interchangeable.
+double CalculateLotSize(double entry, double stopLoss) {
+    double riskAmount = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercentage / 100.0;
+    double distance   = MathAbs(entry - stopLoss);
+    if (distance <= 0.0 || riskAmount <= 0.0) return 0.0;
+
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if (tickValue <= 0.0 || tickSize <= 0.0) return 0.0;
+
+    double lossPerLot = distance / tickSize * tickValue;
+    if (lossPerLot <= 0.0) return 0.0;
+
+    double lots    = riskAmount / lossPerLot;
+    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    if (stepLot <= 0.0) stepLot = minLot;
+
+    lots = MathFloor(lots / stepLot) * stepLot;
+    lots = NormalizeDouble(lots, VolumeDigits(stepLot));
+
+    if (lots > maxLot) lots = maxLot;
+    if (lots < minLot) {
+        Debug(StringFormat("risk %.2f too small for min lot %.2f", riskAmount, minLot));
+        return 0.0;
     }
+
+    double margin = 0.0;
+    double price  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    if (!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lots, price, margin)) return 0.0;
+    if (margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE) * 0.9) {
+        Debug("not enough free margin");
+        return 0.0;
+    }
+
+    return lots;
 }
 
-void UpdateTrailingStops() {
-    for (int i = PositionsTotal() - 1; i >= 0; i--) {
-        if (trade.SelectByIndex(i)) {
-            if (trade.PositionSymbol() == _Symbol) {
-                double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-                double stopLoss = trade.PositionStopLoss();
+//+------------------------------------------------------------------+
+// EXECUTION & MANAGEMENT
+//+------------------------------------------------------------------+
 
-                if (trade.PositionType() == POSITION_TYPE_BUY) {
-                    double newSL = currentPrice - (TrailingStopDistance * _Point);
-                    if (newSL > stopLoss) {
-                        trade.PositionModify(_Symbol, newSL, trade.PositionTakeProfit());
-                    }
-                } else if (trade.PositionType() == POSITION_TYPE_SELL) {
-                    double newSL = currentPrice + (TrailingStopDistance * _Point);
-                    if (newSL < stopLoss) {
-                        trade.PositionModify(_Symbol, newSL, trade.PositionTakeProfit());
-                    }
-                }
-            }
-        }
+// Market entry on the open of the bar following the confirmation close.
+bool ExecuteTrade(BiasDirection direction, double stopLoss, double takeProfit, double lots) {
+    trade.SetTypeFillingBySymbol(_Symbol);
+    trade.SetDeviationInPoints(SlippagePoints);
+
+    bool ok = (direction == BIAS_BULLISH)
+            ? trade.Buy(lots, _Symbol, 0.0, stopLoss, takeProfit, "FVG Buy")
+            : trade.Sell(lots, _Symbol, 0.0, stopLoss, takeProfit, "FVG Sell");
+
+    if (!ok) {
+        Print("[FVG] Order failed. Retcode=", trade.ResultRetcode(),
+              " (", trade.ResultRetcodeDescription(), ")");
+        return false;
     }
-}
 
-//+------------------------------------------------------------------+
-// UTILITY FUNCTIONS
-//+------------------------------------------------------------------+
+    Print(StringFormat("[FVG] %s %.2f lots | entry %.5f | SL %.5f | TP %.5f | R:R %.2f",
+          (direction == BIAS_BULLISH ? "BUY" : "SELL"), lots, trade.ResultPrice(),
+          stopLoss, takeProfit,
+          MathAbs(takeProfit - trade.ResultPrice()) / MathAbs(trade.ResultPrice() - stopLoss)));
+    return true;
+}
 
 int CountOpenTrades() {
     int count = 0;
+
     for (int i = PositionsTotal() - 1; i >= 0; i--) {
-        if (trade.SelectByIndex(i)) {
-            if (trade.PositionSymbol() == _Symbol) {
-                count++;
-            }
-        }
+        if (posInfo.SelectByIndex(i) &&
+            posInfo.Symbol() == _Symbol && posInfo.Magic() == MagicNumber) count++;
     }
+
+    for (int i = OrdersTotal() - 1; i >= 0; i--) {
+        ulong ticket = OrderGetTicket(i);
+        if (ticket > 0 &&
+            OrderGetString(ORDER_SYMBOL) == _Symbol &&
+            OrderGetInteger(ORDER_MAGIC) == MagicNumber) count++;
+    }
+
     return count;
 }
 
-bool IsTradingTime() {
-    int currentHour = Hour();
+void UpdateTrailingStops() {
+    double bid      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double ask      = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double distance = TrailingStopPoints * _Point;
+    double minDist  = MinStopDistance();
 
-    if (StartHour < EndHour) {
-        return (currentHour >= StartHour && currentHour < EndHour);
-    } else {
-        return (currentHour >= StartHour || currentHour < EndHour);
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        if (!posInfo.SelectByIndex(i)) continue;
+        if (posInfo.Symbol() != _Symbol || posInfo.Magic() != MagicNumber) continue;
+
+        double currentSL = posInfo.StopLoss();
+        double openPrice = posInfo.PriceOpen();
+
+        if (posInfo.PositionType() == POSITION_TYPE_BUY) {
+            if (bid - openPrice < distance) continue;      // only trail once in profit
+            double newSL = NormalizeDouble(bid - distance, _Digits);
+            if (newSL > currentSL + _Point && bid - newSL >= minDist)
+                trade.PositionModify(posInfo.Ticket(), newSL, posInfo.TakeProfit());
+        } else {
+            if (openPrice - ask < distance) continue;
+            double newSL = NormalizeDouble(ask + distance, _Digits);
+            if ((currentSL == 0.0 || newSL < currentSL - _Point) && newSL - ask >= minDist)
+                trade.PositionModify(posInfo.Ticket(), newSL, posInfo.TakeProfit());
+        }
     }
 }
 
 //+------------------------------------------------------------------+
-// END OF EA
+// LIFECYCLE
+//+------------------------------------------------------------------+
+
+int OnInit() {
+    trade.SetExpertMagicNumber(MagicNumber);
+
+    if (RiskPercentage <= 0.0 || RiskPercentage > 5.0) {
+        Print("[FVG] RiskPercentage must be between 0 and 5");
+        return INIT_PARAMETERS_INCORRECT;
+    }
+    if (FibonacciRetracementLevel <= 0.0 || FibonacciRetracementLevel >= 1.0) {
+        Print("[FVG] FibonacciRetracementLevel must be between 0 and 1");
+        return INIT_PARAMETERS_INCORRECT;
+    }
+    if (MaxRetracement <= FibonacciRetracementLevel) {
+        Print("[FVG] MaxRetracement must exceed FibonacciRetracementLevel");
+        return INIT_PARAMETERS_INCORRECT;
+    }
+
+    Print("=== FVG Strategy EA v2.00 ===");
+    Print("Symbol: ", _Symbol, " | Risk: ", RiskPercentage, "% | Min R:R: ", MinRiskRewardRatio);
+    return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason) {
+    Print("[FVG] EA stopped (reason ", reason, ")");
+}
+
+void OnTick() {
+    if (UseTrailingStop) UpdateTrailingStops();
+
+    // Everything below runs once per closed M30 bar, never on a forming candle.
+    if (!IsNewBar()) return;
+    if (!IsTradingTime()) return;
+    if (CountOpenTrades() >= MaxOpenTrades) return;
+    if (!SpreadOK()) return;
+
+    BiasDirection d1  = AnalyzeBias(PERIOD_D1);
+    BiasDirection h4  = AnalyzeBias(PERIOD_H4);
+    BiasDirection m30 = AnalyzeBias(PERIOD_M30);
+
+    if (!IsAlignmentValid(d1, h4, m30)) return;
+
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+    int copied = CopyRates(_Symbol, PERIOD_M30, 0, EntryLookbackBars, rates);
+    if (copied < 50) return;
+
+    FVGSetup setup = DetectFVGSetup(d1, rates, copied);
+    if (!setup.isValid) return;
+
+    if (!ValidateConfirmation(d1, rates, setup)) return;
+
+    double entry, stopLoss, takeProfit;
+    if (!CalculateTargets(d1, rates, setup, entry, stopLoss, takeProfit)) return;
+
+    double lots = CalculateLotSize(entry, stopLoss);
+    if (lots <= 0.0) return;
+
+    ExecuteTrade(d1, stopLoss, takeProfit, lots);
+}
 //+------------------------------------------------------------------+
