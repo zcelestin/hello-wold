@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_order_form_payment_status" model="ir.ui.view">
+        <field name="name">sale.order.form.payment.status</field>
+        <field name="model">sale.order</field>
+        <field name="inherit_id" ref="sale.view_order_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//header" position="inside">
+                <button name="action_mark_as_paid" string="Marquer comme payé"
+                        type="object" class="btn-primary"
+                        invisible="state not in ('sale', 'done') or payment_status == 'paid'"/>
+            </xpath>
+            <xpath expr="//field[@name='payment_term_id']" position="after">
+                <field name="payment_status" widget="badge"
+                       decoration-success="payment_status == 'paid'"
+                       decoration-warning="payment_status == 'unpaid'"/>
+                <field name="paid_date" invisible="payment_status != 'paid'"/>
+            </xpath>
+        </field>
+    </record>
+</odoo>
