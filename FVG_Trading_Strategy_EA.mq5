@@ -56,6 +56,7 @@ input group "=== EA Settings ===";
 input bool   ShowDebugInfo        = true;   // Log setup progress
 input bool   UseTrailingStop      = false;  // Use trailing stop
 input int    TrailingStopPoints   = 500;    // Trailing distance (points)
+input bool   ShowSellPanel        = true;   // Show the manual sell buttons
 
 //+------------------------------------------------------------------+
 // TYPES & GLOBALS
@@ -553,6 +554,126 @@ void UpdateTrailingStops() {
 }
 
 //+------------------------------------------------------------------+
+// MANUAL SELL MANAGEMENT
+//+------------------------------------------------------------------+
+
+enum SellAction {
+    SELL_TAKE_PROFIT,      // Encaisser: close only while the net result is positive
+    SELL_CLOSE_NOW,        // Close at market whatever the result
+    SELL_CANCEL_PENDING    // Delete a sell order that has not triggered
+};
+
+// Acts only on this EA's sell trades, so manual trades and other EAs on the
+// same symbol are left alone. Returns how many trades were acted on.
+int ManageSell(SellAction action) {
+    int handled = 0;
+
+    if (action == SELL_CANCEL_PENDING) {
+        for (int i = OrdersTotal() - 1; i >= 0; i--) {
+            ulong ticket = OrderGetTicket(i);
+            if (ticket == 0) continue;
+            if (OrderGetString(ORDER_SYMBOL) != _Symbol)    continue;
+            if (OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+
+            long type = OrderGetInteger(ORDER_TYPE);
+            if (type != ORDER_TYPE_SELL_LIMIT &&
+                type != ORDER_TYPE_SELL_STOP  &&
+                type != ORDER_TYPE_SELL_STOP_LIMIT) continue;
+
+            if (trade.OrderDelete(ticket)) {
+                handled++;
+                Print("[FVG] pending sell order ", ticket, " cancelled");
+            } else {
+                Print("[FVG] cancel failed on order ", ticket,
+                      " retcode=", trade.ResultRetcode(),
+                      " (", trade.ResultRetcodeDescription(), ")");
+            }
+        }
+        if (handled == 0) Print("[FVG] no pending sell order to cancel");
+        return handled;
+    }
+
+    // Downward iteration: closing a position shifts the indices above it.
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        if (!posInfo.SelectByIndex(i)) continue;
+        if (posInfo.Symbol() != _Symbol || posInfo.Magic() != MagicNumber) continue;
+        if (posInfo.PositionType() != POSITION_TYPE_SELL) continue;
+
+        double net = posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+
+        if (action == SELL_TAKE_PROFIT && net <= 0.0) {
+            Print("[FVG] sell ", posInfo.Ticket(), " held: net ",
+                  DoubleToString(net, 2), " is not positive");
+            continue;
+        }
+
+        if (trade.PositionClose(posInfo.Ticket(), SlippagePoints)) {
+            handled++;
+            Print("[FVG] sell ", posInfo.Ticket(), " closed | net ",
+                  DoubleToString(net, 2), " ", AccountInfoString(ACCOUNT_CURRENCY));
+        } else {
+            Print("[FVG] close failed on position ", posInfo.Ticket(),
+                  " retcode=", trade.ResultRetcode(),
+                  " (", trade.ResultRetcodeDescription(), ")");
+        }
+    }
+
+    if (handled == 0) Print("[FVG] no sell position of this EA on ", _Symbol);
+    return handled;
+}
+
+//+------------------------------------------------------------------+
+// CHART BUTTONS
+//+------------------------------------------------------------------+
+
+#define BTN_PROFIT "FVG_btn_profit"
+#define BTN_CLOSE  "FVG_btn_close"
+#define BTN_CANCEL "FVG_btn_cancel"
+
+void CreateButton(string name, string text, int y, color background) {
+    if (ObjectFind(0, name) >= 0) return;
+    ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0);
+    ObjectSetInteger(0, name, OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
+    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 140);
+    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, name, OBJPROP_XSIZE,     130);
+    ObjectSetInteger(0, name, OBJPROP_YSIZE,     26);
+    ObjectSetString (0, name, OBJPROP_TEXT,      text);
+    ObjectSetInteger(0, name, OBJPROP_BGCOLOR,   background);
+    ObjectSetInteger(0, name, OBJPROP_COLOR,     clrWhite);
+    ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  9);
+}
+
+void CreateSellPanel() {
+    if (!ShowSellPanel) return;
+    CreateButton(BTN_PROFIT, "Encaisser vente", 22, clrSeaGreen);
+    CreateButton(BTN_CLOSE,  "Cloturer vente",  54, clrChocolate);
+    CreateButton(BTN_CANCEL, "Annuler ordre",   86, clrFireBrick);
+    ChartRedraw();
+}
+
+void RemoveSellPanel() {
+    ObjectDelete(0, BTN_PROFIT);
+    ObjectDelete(0, BTN_CLOSE);
+    ObjectDelete(0, BTN_CANCEL);
+}
+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam) {
+    if (id != CHARTEVENT_OBJECT_CLICK) return;
+
+    SellAction action;
+    if      (sparam == BTN_PROFIT) action = SELL_TAKE_PROFIT;
+    else if (sparam == BTN_CLOSE)  action = SELL_CLOSE_NOW;
+    else if (sparam == BTN_CANCEL) action = SELL_CANCEL_PENDING;
+    else return;
+
+    ManageSell(action);
+
+    ObjectSetInteger(0, sparam, OBJPROP_STATE, false);   // pop the button back up
+    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
 // LIFECYCLE
 //+------------------------------------------------------------------+
 
@@ -581,10 +702,14 @@ int OnInit() {
             Print("[FVG] Warning: ", names[i], " has ", available, " bars, ",
                   BiasLookbackBars, " expected. Load more history.");
     }
+
+    CreateSellPanel();
     return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason) {
+    RemoveSellPanel();
+
     Print("=== FVG funnel (bars reaching each gate) ===");
     Print("  bars evaluated .... ", g_funnel.bars);
     Print("  trading hours ..... ", g_funnel.timeOK);
