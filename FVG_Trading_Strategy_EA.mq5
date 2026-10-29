@@ -8,7 +8,7 @@
 //| because the reaction is not expected on the bar that finds it.    |
 //+------------------------------------------------------------------+
 #property copyright "Celestin Zongo"
-#property version   "3.00"
+#property version   "3.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -28,11 +28,12 @@ input group "=== Structure / Impulse ===";
 input int    BiasLookbackBars          = 120;    // Bars scanned for swing structure
 input int    EntryLookbackBars         = 200;    // M30 bars scanned for impulse/FVG
 input int    ImpulseMinBars            = 4;      // Minimum bars in the impulse leg
-input double MinImpulsePips            = 15.0;   // Minimum impulse size (pips)
+input int    ATRPeriod                 = 14;     // ATR period sizing every threshold
+input double MinImpulseATR             = 1.5;    // Minimum impulse size (x ATR)
 
 input group "=== Retracement / FVG ===";
 input double FibonacciRetracementLevel = 0.5;    // FVG must sit beyond this level
-input double FVGMinPips                = 2.0;    // Minimum FVG size (pips)
+input double FVGMinATR                 = 0.25;   // Minimum FVG size (x ATR)
 input int    SetupMaxBars              = 40;     // Bars an armed setup stays valid
 
 input group "=== Candle Confirmation ===";
@@ -44,9 +45,9 @@ input double MaxIndecisionBodyPercent   = 50.0;  // Max body size for indecision
 input double MinConfirmationBodyPercent = 55.0;  // Min body size for confirmation (%)
 
 input group "=== Execution ===";
-input int    MaxSpreadPoints    = 50;   // Max spread allowed (points, 0 = off)
+input double MaxSpreadATR       = 0.15; // Max spread allowed (x ATR, 0 = off)
 input int    SlippagePoints     = 20;   // Max deviation (points)
-input int    SLBufferPoints     = 20;   // Extra distance beyond invalidation
+input double SLBufferATR        = 0.20; // Extra distance beyond invalidation (x ATR)
 
 input group "=== Trading Hours (server time) ===";
 input int    StartHour = 0;             // Start trading at (0-23)
@@ -55,7 +56,7 @@ input int    EndHour   = 0;             // Stop trading at (0-23, equal = 24h)
 input group "=== EA Settings ===";
 input bool   ShowDebugInfo        = true;   // Log setup progress
 input bool   UseTrailingStop      = false;  // Use trailing stop
-input int    TrailingStopPoints   = 500;    // Trailing distance (points)
+input double TrailingStopATR      = 1.0;    // Trailing distance (x ATR)
 input bool   ShowSellPanel        = true;   // Show the manual sell buttons
 
 //+------------------------------------------------------------------+
@@ -108,13 +109,19 @@ struct Funnel {
 ArmedSetup g_setup;
 Funnel     g_funnel;
 datetime   g_lastBarTime = 0;
+int        g_atrHandle   = INVALID_HANDLE;
 
 //+------------------------------------------------------------------+
 // HELPERS
 //+------------------------------------------------------------------+
 
-double PipSize() {
-    return (_Digits == 3 || _Digits == 5) ? _Point * 10.0 : _Point;
+// Every distance threshold is a multiple of this, so the EA carries no
+// assumption about the instrument's price scale, digits or pip convention.
+// Read on bar 1: the forming bar would move the thresholds tick by tick.
+double ATR() {
+    double buffer[];
+    if (CopyBuffer(g_atrHandle, 0, 1, 1, buffer) != 1) return 0.0;
+    return buffer[0];
 }
 
 int VolumeDigits(double step) {
@@ -163,9 +170,12 @@ bool IsTradingTime() {
     return (dt.hour >= StartHour || dt.hour < EndHour);
 }
 
-bool SpreadOK() {
-    if (MaxSpreadPoints <= 0) return true;
-    return SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) <= MaxSpreadPoints;
+// Compared against ATR rather than a point count: 30 points is tight on one
+// instrument and prohibitive on another.
+bool SpreadOK(double atr) {
+    if (MaxSpreadATR <= 0.0) return true;
+    double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * _Point;
+    return (spread <= atr * MaxSpreadATR);
 }
 
 //+------------------------------------------------------------------+
@@ -174,6 +184,10 @@ bool SpreadOK() {
 
 // Fractal swing: extreme against the two bars either side. Scanning starts at
 // shift 3 so bar 0 (still forming) never takes part in confirming a swing.
+//
+// Ties count towards the older side and not the newer one. Four strict
+// comparisons miss every flat top, which is routine on instruments that move
+// in fixed increments and would silently starve the whole chain of structure.
 int FindSwings(const MqlRates &rates[], int total, bool findHighs, SwingPoint &out[]) {
     ArrayResize(out, 0);
     int found = 0;
@@ -182,12 +196,12 @@ int FindSwings(const MqlRates &rates[], int total, bool findHighs, SwingPoint &o
         bool isSwing;
         if (findHighs) {
             double v = rates[i].high;
-            isSwing = (v > rates[i-1].high && v > rates[i-2].high &&
-                       v > rates[i+1].high && v > rates[i+2].high);
+            isSwing = (v >= rates[i-1].high && v >= rates[i-2].high &&
+                       v >  rates[i+1].high && v >  rates[i+2].high);
         } else {
             double v = rates[i].low;
-            isSwing = (v < rates[i-1].low && v < rates[i-2].low &&
-                       v < rates[i+1].low && v < rates[i+2].low);
+            isSwing = (v <= rates[i-1].low && v <= rates[i-2].low &&
+                       v <  rates[i+1].low && v <  rates[i+2].low);
         }
 
         if (isSwing) {
@@ -230,7 +244,7 @@ bool IsAlignmentValid(BiasDirection d1, BiasDirection h4, BiasDirection m30) {
 // The bullish impulse tops at the most recent swing high; its origin is the
 // nearest swing low BEFORE it. The retracement creates a newer swing low after
 // the high, which must not be mistaken for the origin.
-bool DetectImpulse(BiasDirection direction, const MqlRates &rates[], int total,
+bool DetectImpulse(BiasDirection direction, const MqlRates &rates[], int total, double atr,
                    double &impulseHigh, double &impulseLow,
                    int &highShift, int &lowShift) {
     SwingPoint highs[], lows[];
@@ -262,7 +276,7 @@ bool DetectImpulse(BiasDirection direction, const MqlRates &rates[], int total,
         highShift   = highs[idx].shift;
     }
 
-    if ((impulseHigh - impulseLow) / PipSize() < MinImpulsePips) return false;
+    if (impulseHigh - impulseLow < atr * MinImpulseATR) return false;
     return (MathAbs(highShift - lowShift) >= ImpulseMinBars);
 }
 
@@ -270,7 +284,7 @@ bool DetectImpulse(BiasDirection direction, const MqlRates &rates[], int total,
 // of the oldest, leaving an untraded gap. Only gaps inside the impulse leg and
 // beyond the 50% level qualify - price reaching such a gap has by construction
 // retraced at least 50%, so no separate retracement test is needed.
-bool DetectFVG(BiasDirection direction, const MqlRates &rates[], int total,
+bool DetectFVG(BiasDirection direction, const MqlRates &rates[], int total, double atr,
                double impulseHigh, double impulseLow, int highShift, int lowShift,
                double &fvgHigh, double &fvgLow) {
     double range    = impulseHigh - impulseLow;
@@ -280,7 +294,7 @@ bool DetectFVG(BiasDirection direction, const MqlRates &rates[], int total,
 
     int newest = (direction == BIAS_BULLISH) ? highShift : lowShift;
     int oldest = (direction == BIAS_BULLISH) ? lowShift  : highShift;
-    double minGap = FVGMinPips * PipSize();
+    double minGap = atr * FVGMinATR;
 
     for (int i = newest; i + 2 <= oldest && i + 2 < total; i++) {
         double gapLow, gapHigh;
@@ -316,6 +330,13 @@ bool PriceInFVG(const MqlRates &rates[]) {
 
 bool SetupInvalidated(const MqlRates &rates[]) {
     if (g_setup.age > SetupMaxBars) { Debug("setup expired"); return true; }
+
+    // A setup lives for many bars, so the daily bias is re-read each time: the
+    // strategy never takes a trade against it.
+    if (AnalyzeBias(PERIOD_D1) != g_setup.direction) {
+        Debug("D1 bias flipped, setup dropped");
+        return true;
+    }
 
     if (g_setup.direction == BIAS_BULLISH) {
         if (rates[1].close < g_setup.impulseLow) { Debug("impulse origin broken"); return true; }
@@ -407,8 +428,9 @@ bool FindTakeProfit(BiasDirection direction, double entry, double risk, double &
     return true;
 }
 
-bool CalculateTargets(const MqlRates &rates[], double &entry, double &stopLoss, double &takeProfit) {
-    double buffer  = SLBufferPoints * _Point;
+bool CalculateTargets(const MqlRates &rates[], double atr,
+                      double &entry, double &stopLoss, double &takeProfit) {
+    double buffer  = atr * SLBufferATR;
     double minDist = MinStopDistance();
     bool   bullish = (g_setup.direction == BIAS_BULLISH);
 
@@ -472,9 +494,11 @@ double CalculateLotSize(double entry, double stopLoss) {
         return 0.0;
     }
 
+    bool bullish = (g_setup.direction == BIAS_BULLISH);
     double margin = 0.0;
-    if (!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lots,
-                         SymbolInfoDouble(_Symbol, SYMBOL_ASK), margin)) return 0.0;
+    if (!OrderCalcMargin(bullish ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, _Symbol, lots,
+                         SymbolInfoDouble(_Symbol, bullish ? SYMBOL_ASK : SYMBOL_BID),
+                         margin)) return 0.0;
     if (margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE) * 0.9) {
         Debug("not enough free margin");
         return 0.0;
@@ -526,10 +550,12 @@ int CountOpenTrades() {
     return count;
 }
 
-void UpdateTrailingStops() {
+void UpdateTrailingStops(double atr) {
+    if (atr <= 0.0) return;
+
     double bid      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     double ask      = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-    double distance = TrailingStopPoints * _Point;
+    double distance = atr * TrailingStopATR;
     double minDist  = MinStopDistance();
 
     for (int i = PositionsTotal() - 1; i >= 0; i--) {
@@ -691,7 +717,13 @@ int OnInit() {
         return INIT_PARAMETERS_INCORRECT;
     }
 
-    Print("=== FVG Strategy EA v3.00 ===");
+    g_atrHandle = iATR(_Symbol, PERIOD_M30, ATRPeriod);
+    if (g_atrHandle == INVALID_HANDLE) {
+        Print("[FVG] Failed to create the ATR indicator");
+        return INIT_FAILED;
+    }
+
+    Print("=== FVG Strategy EA v3.10 ===");
     Print("Symbol: ", _Symbol, " | Risk: ", RiskPercentage, "% | Min R:R: ", MinRiskRewardRatio);
 
     ENUM_TIMEFRAMES frames[] = {PERIOD_D1, PERIOD_H4, PERIOD_M30};
@@ -709,6 +741,7 @@ int OnInit() {
 
 void OnDeinit(const int reason) {
     RemoveSellPanel();
+    if (g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
 
     Print("=== FVG funnel (bars reaching each gate) ===");
     Print("  bars evaluated .... ", g_funnel.bars);
@@ -727,13 +760,20 @@ void OnDeinit(const int reason) {
 }
 
 void OnTick() {
-    if (UseTrailingStop) UpdateTrailingStops();
+    double atr = ATR();
+    if (UseTrailingStop) UpdateTrailingStops(atr);
     if (!IsNewBar()) return;
+    if (atr <= 0.0) { Debug("ATR not ready"); return; }
 
     g_funnel.bars++;
+
+    // Aged before the gates below, so a setup cannot outlive SetupMaxBars just
+    // because the spread widened or the session closed.
+    if (g_setup.active) g_setup.age++;
+
     if (!IsTradingTime()) return;
     g_funnel.timeOK++;
-    if (!SpreadOK()) return;
+    if (!SpreadOK(atr)) return;
     g_funnel.spreadOK++;
     if (CountOpenTrades() >= MaxOpenTrades) return;
     g_funnel.slotOK++;
@@ -744,8 +784,6 @@ void OnTick() {
 
     // ---- an armed setup is watched until it fires or dies -------------------
     if (g_setup.active) {
-        g_setup.age++;
-
         if (SetupInvalidated(rates)) { g_setup.active = false; return; }
 
         if (!g_setup.priceReturned) {
@@ -759,7 +797,7 @@ void OnTick() {
         g_funnel.reaction++;
 
         double entry, stopLoss, takeProfit;
-        if (!CalculateTargets(rates, entry, stopLoss, takeProfit)) return;
+        if (!CalculateTargets(rates, atr, entry, stopLoss, takeProfit)) return;
         g_funnel.targetsOK++;
 
         double lots = CalculateLotSize(entry, stopLoss);
@@ -788,11 +826,11 @@ void OnTick() {
 
     double impulseHigh, impulseLow;
     int highShift, lowShift;
-    if (!DetectImpulse(d1, rates, copied, impulseHigh, impulseLow, highShift, lowShift)) return;
+    if (!DetectImpulse(d1, rates, copied, atr, impulseHigh, impulseLow, highShift, lowShift)) return;
     g_funnel.impulse++;
 
     double fvgHigh, fvgLow;
-    if (!DetectFVG(d1, rates, copied, impulseHigh, impulseLow, highShift, lowShift,
+    if (!DetectFVG(d1, rates, copied, atr, impulseHigh, impulseLow, highShift, lowShift,
                    fvgHigh, fvgLow)) return;
     g_funnel.fvgFound++;
 
