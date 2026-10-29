@@ -1,15 +1,22 @@
 //+------------------------------------------------------------------+
 //|                                       FVG_Trading_Strategy_EA.mq5 |
 //|                                                                   |
-//| D1 bias -> H4 confirm -> M30 entry                                |
-//| Impulse -> FVG below 50% -> price returns -> 3-candle reaction    |
+//| D1 bias -> H4 confirm -> M30 structure -> M5 entry                |
+//|                                                                   |
+//| Structure timeframe: alignment, impulse, FVG, take-profit levels. |
+//| Entry timeframe: price returning into the FVG, the 3-candle       |
+//| reaction and the stop. Reading the trigger finer than the         |
+//| structure tightens the stop without loosening the thesis.         |
 //|                                                                   |
 //| The setup is armed once and then watched over the following bars, |
 //| because the reaction is not expected on the bar that finds it.    |
 //+------------------------------------------------------------------+
 #property copyright "Celestin Zongo"
-#property version   "3.10"
+#property version   "3.20"
 #property strict
+
+#define STRUCTURE_TF  PERIOD_M30   // alignment, impulse, FVG, TP levels
+#define ENTRY_TF      PERIOD_M5    // FVG return, reaction, entry, stop
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -26,17 +33,17 @@ input int    MagicNumber               = 123456; // Magic number
 
 input group "=== Structure / Impulse ===";
 input int    BiasLookbackBars          = 120;    // Bars scanned for swing structure
-input int    EntryLookbackBars         = 200;    // M30 bars scanned for impulse/FVG
-input int    ImpulseMinBars            = 4;      // Minimum bars in the impulse leg
+input int    StructureLookbackBars     = 200;    // Structure bars scanned for impulse/FVG
+input int    ImpulseMinBars            = 4;      // Minimum structure bars in the impulse leg
 input int    ATRPeriod                 = 14;     // ATR period sizing every threshold
-input double MinImpulseATR             = 1.5;    // Minimum impulse size (x ATR)
+input double MinImpulseATR             = 1.5;    // Minimum impulse size (x structure ATR)
 
 input group "=== Retracement / FVG ===";
 input double FibonacciRetracementLevel = 0.5;    // FVG must sit beyond this level
-input double FVGMinATR                 = 0.25;   // Minimum FVG size (x ATR)
-input int    SetupMaxBars              = 40;     // Bars an armed setup stays valid
+input double FVGMinATR                 = 0.25;   // Minimum FVG size (x structure ATR)
+input int    SetupMaxBars              = 40;     // Structure bars an armed setup stays valid
 
-input group "=== Candle Confirmation ===";
+input group "=== Candle Confirmation (entry timeframe) ===";
 input bool   RequireRejectionCandle     = true;  // Candle 1: rejection inside FVG
 input bool   RequireIndecisionCandle    = true;  // Candle 2: indecision
 input bool   RequireConfirmationCandle  = true;  // Candle 3: strong close
@@ -45,9 +52,9 @@ input double MaxIndecisionBodyPercent   = 50.0;  // Max body size for indecision
 input double MinConfirmationBodyPercent = 55.0;  // Min body size for confirmation (%)
 
 input group "=== Execution ===";
-input double MaxSpreadATR       = 0.15; // Max spread allowed (x ATR, 0 = off)
+input double MaxSpreadATR       = 0.30; // Max spread allowed (x entry ATR, 0 = off)
 input int    SlippagePoints     = 20;   // Max deviation (points)
-input double SLBufferATR        = 0.20; // Extra distance beyond invalidation (x ATR)
+input double SLBufferATR        = 0.40; // Extra distance beyond invalidation (x entry ATR)
 
 input group "=== Trading Hours (server time) ===";
 input int    StartHour = 0;             // Start trading at (0-23)
@@ -108,19 +115,23 @@ struct Funnel {
 
 ArmedSetup g_setup;
 Funnel     g_funnel;
-datetime   g_lastBarTime = 0;
-int        g_atrHandle   = INVALID_HANDLE;
+datetime   g_lastStructBar = 0;
+datetime   g_lastEntryBar  = 0;
+int        g_atrStruct     = INVALID_HANDLE;
+int        g_atrEntry      = INVALID_HANDLE;
 
 //+------------------------------------------------------------------+
 // HELPERS
 //+------------------------------------------------------------------+
 
-// Every distance threshold is a multiple of this, so the EA carries no
+// Every distance threshold is a multiple of an ATR, so the EA carries no
 // assumption about the instrument's price scale, digits or pip convention.
-// Read on bar 1: the forming bar would move the thresholds tick by tick.
-double ATR() {
+// Structure thresholds use the structure timeframe, entry and execution
+// thresholds the entry timeframe. Read on bar 1: the forming bar would move
+// the thresholds tick by tick.
+double ATR(int handle) {
     double buffer[];
-    if (CopyBuffer(g_atrHandle, 0, 1, 1, buffer) != 1) return 0.0;
+    if (CopyBuffer(handle, 0, 1, 1, buffer) != 1) return 0.0;
     return buffer[0];
 }
 
@@ -155,10 +166,10 @@ int LoadRates(ENUM_TIMEFRAMES timeframe, int count, MqlRates &rates[]) {
     return copied;
 }
 
-bool IsNewBar() {
-    datetime t = iTime(_Symbol, PERIOD_M30, 0);
-    if (t == 0 || t == g_lastBarTime) return false;
-    g_lastBarTime = t;
+bool IsNewBar(ENUM_TIMEFRAMES timeframe, datetime &last) {
+    datetime t = iTime(_Symbol, timeframe, 0);
+    if (t == 0 || t == last) return false;
+    last = t;
     return true;
 }
 
@@ -410,7 +421,7 @@ bool FindTakeProfit(BiasDirection direction, double entry, double risk, double &
     ArrayResize(candidates, 0);
 
     bool wantHighs = (direction == BIAS_BULLISH);
-    CollectTargets(PERIOD_M30, wantHighs, entry, candidates);
+    CollectTargets(STRUCTURE_TF, wantHighs, entry, candidates);
     CollectTargets(PERIOD_H4,  wantHighs, entry, candidates);
 
     double best = 0.0;
@@ -717,18 +728,20 @@ int OnInit() {
         return INIT_PARAMETERS_INCORRECT;
     }
 
-    g_atrHandle = iATR(_Symbol, PERIOD_M30, ATRPeriod);
-    if (g_atrHandle == INVALID_HANDLE) {
-        Print("[FVG] Failed to create the ATR indicator");
+    g_atrStruct = iATR(_Symbol, STRUCTURE_TF, ATRPeriod);
+    g_atrEntry  = iATR(_Symbol, ENTRY_TF,     ATRPeriod);
+    if (g_atrStruct == INVALID_HANDLE || g_atrEntry == INVALID_HANDLE) {
+        Print("[FVG] Failed to create the ATR indicators");
         return INIT_FAILED;
     }
 
-    Print("=== FVG Strategy EA v3.10 ===");
+    Print("=== FVG Strategy EA v3.20 ===");
     Print("Symbol: ", _Symbol, " | Risk: ", RiskPercentage, "% | Min R:R: ", MinRiskRewardRatio);
+    Print("Structure: ", EnumToString(STRUCTURE_TF), " | Entry: ", EnumToString(ENTRY_TF));
 
-    ENUM_TIMEFRAMES frames[] = {PERIOD_D1, PERIOD_H4, PERIOD_M30};
-    string names[] = {"D1", "H4", "M30"};
-    for (int i = 0; i < 3; i++) {
+    ENUM_TIMEFRAMES frames[] = {PERIOD_D1, PERIOD_H4, STRUCTURE_TF, ENTRY_TF};
+    string names[] = {"D1", "H4", "structure", "entry"};
+    for (int i = 0; i < 4; i++) {
         int available = Bars(_Symbol, frames[i]);
         if (available < BiasLookbackBars)
             Print("[FVG] Warning: ", names[i], " has ", available, " bars, ",
@@ -741,14 +754,15 @@ int OnInit() {
 
 void OnDeinit(const int reason) {
     RemoveSellPanel();
-    if (g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+    if (g_atrStruct != INVALID_HANDLE) IndicatorRelease(g_atrStruct);
+    if (g_atrEntry  != INVALID_HANDLE) IndicatorRelease(g_atrEntry);
 
     Print("=== FVG funnel (bars reaching each gate) ===");
-    Print("  bars evaluated .... ", g_funnel.bars);
+    Print("  entry bars ........ ", g_funnel.bars);
     Print("  trading hours ..... ", g_funnel.timeOK);
     Print("  spread ok ......... ", g_funnel.spreadOK);
     Print("  free slot ......... ", g_funnel.slotOK);
-    Print("  D1=H4=M30 aligned . ", g_funnel.aligned);
+    Print("  3 timeframes align  ", g_funnel.aligned);
     Print("  impulse found ..... ", g_funnel.impulse);
     Print("  FVG below 50% ..... ", g_funnel.fvgFound);
     Print("  setups armed ...... ", g_funnel.armed);
@@ -760,44 +774,51 @@ void OnDeinit(const int reason) {
 }
 
 void OnTick() {
-    double atr = ATR();
-    if (UseTrailingStop) UpdateTrailingStops(atr);
-    if (!IsNewBar()) return;
-    if (atr <= 0.0) { Debug("ATR not ready"); return; }
+    double atrStruct = ATR(g_atrStruct);
+    double atrEntry  = ATR(g_atrEntry);
+
+    if (UseTrailingStop) UpdateTrailingStops(atrStruct);
+
+    // The entry timeframe drives the loop, so the reaction is read as soon as
+    // each of its bars closes. The structure timeframe is checked second: a new
+    // structure bar always opens one of these too, so none is ever missed.
+    if (!IsNewBar(ENTRY_TF, g_lastEntryBar)) return;
+    bool newStructureBar = IsNewBar(STRUCTURE_TF, g_lastStructBar);
+
+    if (atrStruct <= 0.0 || atrEntry <= 0.0) { Debug("ATR not ready"); return; }
 
     g_funnel.bars++;
 
-    // Aged before the gates below, so a setup cannot outlive SetupMaxBars just
-    // because the spread widened or the session closed.
-    if (g_setup.active) g_setup.age++;
+    // Aged in structure bars and before the gates below, so a setup cannot
+    // outlive SetupMaxBars because the spread widened or the session closed.
+    if (g_setup.active && newStructureBar) g_setup.age++;
 
     if (!IsTradingTime()) return;
     g_funnel.timeOK++;
-    if (!SpreadOK(atr)) return;
+    if (!SpreadOK(atrEntry)) return;
     g_funnel.spreadOK++;
     if (CountOpenTrades() >= MaxOpenTrades) return;
     g_funnel.slotOK++;
 
-    MqlRates rates[];
-    int copied = LoadRates(PERIOD_M30, EntryLookbackBars, rates);
-    if (copied < 50) { Debug(StringFormat("only %d M30 bars available", copied)); return; }
-
-    // ---- an armed setup is watched until it fires or dies -------------------
+    // ---- an armed setup is watched on the entry timeframe -------------------
     if (g_setup.active) {
-        if (SetupInvalidated(rates)) { g_setup.active = false; return; }
+        MqlRates entryRates[];
+        if (LoadRates(ENTRY_TF, 60, entryRates) < 10) return;
+
+        if (SetupInvalidated(entryRates)) { g_setup.active = false; return; }
 
         if (!g_setup.priceReturned) {
-            if (!PriceInFVG(rates)) return;
+            if (!PriceInFVG(entryRates)) return;
             g_setup.priceReturned = true;
             g_funnel.returned++;
-            Debug("price returned into the FVG, waiting for the reaction");
+            Debug("price returned into the FVG, watching for the reaction");
         }
 
-        if (!ValidateReaction(rates)) return;
+        if (!ValidateReaction(entryRates)) return;
         g_funnel.reaction++;
 
         double entry, stopLoss, takeProfit;
-        if (!CalculateTargets(rates, atr, entry, stopLoss, takeProfit)) return;
+        if (!CalculateTargets(entryRates, atrEntry, entry, stopLoss, takeProfit)) return;
         g_funnel.targetsOK++;
 
         double lots = CalculateLotSize(entry, stopLoss);
@@ -809,28 +830,35 @@ void OnTick() {
         return;
     }
 
-    // ---- otherwise look for a new setup ------------------------------------
+    // ---- discovery is structure work, so it runs once per structure bar -----
+    if (!newStructureBar) return;
+
+    MqlRates rates[];
+    int copied = LoadRates(STRUCTURE_TF, StructureLookbackBars, rates);
+    if (copied < 50) { Debug(StringFormat("only %d structure bars available", copied)); return; }
+
     BiasDirection d1  = AnalyzeBias(PERIOD_D1);
     BiasDirection h4  = AnalyzeBias(PERIOD_H4);
-    BiasDirection m30 = AnalyzeBias(PERIOD_M30);
+    BiasDirection str = AnalyzeBias(STRUCTURE_TF);
 
     static string lastState = "";
-    string state = BiasName(d1) + " / " + BiasName(h4) + " / " + BiasName(m30);
+    string state = BiasName(d1) + " / " + BiasName(h4) + " / " + BiasName(str);
     if (state != lastState) {
         lastState = state;
-        Debug("bias D1/H4/M30 = " + state +
-              (IsAlignmentValid(d1, h4, m30) ? "   << ALIGNED" : ""));
+        Debug("bias D1/H4/structure = " + state +
+              (IsAlignmentValid(d1, h4, str) ? "   << ALIGNED" : ""));
     }
-    if (!IsAlignmentValid(d1, h4, m30)) return;
+    if (!IsAlignmentValid(d1, h4, str)) return;
     g_funnel.aligned++;
 
     double impulseHigh, impulseLow;
     int highShift, lowShift;
-    if (!DetectImpulse(d1, rates, copied, atr, impulseHigh, impulseLow, highShift, lowShift)) return;
+    if (!DetectImpulse(d1, rates, copied, atrStruct,
+                       impulseHigh, impulseLow, highShift, lowShift)) return;
     g_funnel.impulse++;
 
     double fvgHigh, fvgLow;
-    if (!DetectFVG(d1, rates, copied, atr, impulseHigh, impulseLow, highShift, lowShift,
+    if (!DetectFVG(d1, rates, copied, atrStruct, impulseHigh, impulseLow, highShift, lowShift,
                    fvgHigh, fvgLow)) return;
     g_funnel.fvgFound++;
 
